@@ -28,7 +28,9 @@ principles + LaTeX house style).
   per line keeps diffs minimal).
 
 ## Procedure
-1. Read the passage plus enough surrounding text to keep terminology consistent.
+1. First read a few passages the author has already written *fluently* to learn
+   their style and level of English, then match it — "chameleon mode". Then read
+   the target passage plus enough surrounding text to keep terminology consistent.
 2. Propose each change as a tracked edit via `papyrus-latex-suggestions` —
    `\aisuggest[author=papyrus, id=…, status=pending]{old}{new}` — so the old text
    is preserved and the author decides.

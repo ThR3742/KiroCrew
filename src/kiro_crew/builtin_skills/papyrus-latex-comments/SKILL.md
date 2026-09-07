@@ -1,7 +1,7 @@
 ---
 name: papyrus-latex-comments
 description: Set up and use a non-destructive COMMENT layer in a LaTeX document — insert margin/inline notes (tagged by type) next to the author's text instead of rewriting it. Use when asked to comment on, review, or annotate a .tex file. For proposing actual replacement text the author can accept/reject, use papyrus-latex-suggestions.
-triggers: comment, annotate, todonotes, margin note, review note, aicomment
+triggers: latex comment, annotate tex, todonotes, margin note, aicomment
 ---
 
 # LaTeX Comments
@@ -23,18 +23,17 @@ preamble (never duplicate it if it is already there):
 
 ```latex
 % ==== Papyrus comment layer — safe to leave in; flip to hide ====
-\usepackage[colorinlistoftodos,textsize=scriptsize]{todonotes}
+\usepackage[textsize=scriptsize]{todonotes}
 \newcommand{\aicomment}[1]{\todo[color=cyan!25,bordercolor=cyan]{\textbf{AI:} #1}}   % margin note
-\newcommand{\aiinline}[1]{\todo[inline,color=cyan!25]{\textbf{AI:} #1}}              % full-width block in the text
 \newcommand{\aisuggest}[2]{#1\aicomment{suggest → #2}}                              % keep original, idea in the margin
 % FINAL BUILD: change the \usepackage line to  \usepackage[disable]{todonotes}
 % ================================================================
 ```
 
-Margin space is tight, so `textsize=scriptsize` keeps notes readable in a normal
-one-column margin. In a **two-column or narrow-margin** paper the margin barely
-exists and margin notes overflow — use `\aiinline` (a full-width block in the
-text flow) instead of `\aicomment`.
+Margin space is tight, so `textsize=scriptsize` keeps notes readable in a
+one-column margin. Comments live in the **margin only** — a note must never
+change the paper's length or reflow the text. In a two-column or narrow-margin
+paper, keep each note short rather than pushing it into the text flow.
 
 ## Step 2 — Insert comments
 
@@ -44,12 +43,13 @@ note with the taxonomy (`[claim] [cite] [clarity] [structure] [contribution]
 
 ```latex
 The method is fast.\aicomment{[claim] by how much? add a number + CI}
-\aiinline{[structure] this reads like Related Work — consider moving it}
+This paragraph reads like Related Work.\aicomment{[structure] consider moving it there}
 We \aisuggest{imitate}{reproduce} the baseline.   % original stays; idea in the margin
 ```
 
-Put `\listoftodos` after `\maketitle` (or in an appendix) so the author gets a
-review to-do list and can address each note, then delete the macro call.
+Do NOT add `\listoftodos` — it inserts a full page and changes the paper's
+length. The margin notes themselves are the review list: the author addresses
+each one and deletes its macro call.
 
 ## Step 3 — Finalize
 
@@ -59,6 +59,7 @@ addressed.
 
 ## Rules
 
+- Comments live in the **margin** and must not change the paper's length — no `\listoftodos`, no full-width inline blocks.
 - Insert macro calls; never rewrite prose the author did not ask you to change.
 - Never fabricate a citation to fill a `[cite]` note.
 - One sentence per line in the source keeps every suggested diff minimal.

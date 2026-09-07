@@ -59,6 +59,9 @@ sentence-local and minimal; never reflow the surrounding text.
 - **Accept ALL at once (final render):** flip `\showeditstrue` → `\showeditsfalse`
   in the preamble — every suggestion renders as its final text with no markup, in
   one edit.
+- **Rework one:** don't edit a live suggestion in place — it is fiddly and
+  error-prone. Reject it (remove the macro, keep the old text) and propose a
+  fresh `\aisuggest` instead.
 
 ## Step 4 — Version diff (optional)
 
