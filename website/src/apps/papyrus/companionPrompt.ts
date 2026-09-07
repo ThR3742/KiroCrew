@@ -13,8 +13,12 @@
 export const DEFAULT_MAIN_FILE = 'main.tex'
 
 const LOAD_SKILL_INSTRUCTION =
-  'Load the `papyrus-writing` skill for the project path, the compile workflow,'
-  + ' and the LaTeX style rules before editing.'
+  'Load the `papyrus-writing` skill first — it carries the conduct, the'
+  + ' paper-quality principles, the LaTeX house style, and the project path. Then'
+  + ' load the task skill that fits the request: `papyrus-review-paper` (feedback'
+  + ' as comments), `papyrus-make-fluent` (polish as tracked suggestions),'
+  + ' `papyrus-latex-comments` / `papyrus-latex-suggestions` (the annotation'
+  + ' mechanics), or `papyrus-diagnose-compilation` (a build failure).'
 
 const READ_BEFORE_WRITE_INSTRUCTION =
   'Read a file before you change it — the author is editing it live in the'
