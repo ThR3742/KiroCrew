@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  buildTree, countDiagnostics, countWords, flattenTree, gitBranchLabel, isArtifact,
-  loadLastProject, loadSlot, pruneSlots, saveLastProject,
-  saveSlot, SLOT_KEY_PREFIX, sourceFiles, texFiles,
+  buildTree, countDiagnostics, countWords, DEFAULT_PDF_WIDTH, defaultPdfWidth,
+  flattenTree, gitBranchLabel, isArtifact,
+  loadLastProject, loadSlot, MAX_PDF_WIDTH, maxPdfWidth, MIN_PDF_WIDTH, pruneSlots,
+  saveLastProject, saveSlot, SLOT_KEY_PREFIX, sourceFiles, texFiles,
 } from '../apps/papyrus/lib'
 import type { Diagnostic } from '../apps/papyrus/api'
 
@@ -247,5 +248,77 @@ describe('project + slot persistence', () => {
     expect(loadLastProject()).toBeNull()
     expect(loadSlot('p')).toBeNull()
     getItem.mockRestore()
+  })
+})
+
+describe('maxPdfWidth', () => {
+  // The preview's ceiling is a share of the window because the editor has no
+  // grip of its own: it absorbs whatever the preview leaves, so a fixed cap
+  // decides how small the author is allowed to make the editor, and that
+  // allowance has to scale with the screen.
+  it.each([
+    [1280, 640],
+    [1440, 720],
+    [1920, 960],
+    [2560, 1280],
+    [3440, 1720],
+  ])('gives half of a %ipx window to the preview', (viewport, expected) => {
+    expect(maxPdfWidth(viewport)).toBe(expected)
+  })
+
+  it('reproduces the reach the 50% split had before the column was resizable', () => {
+    // The regression this replaces: a flat 900 took 380px of reach away at 2560.
+    expect(maxPdfWidth(2560)).toBeGreaterThan(MAX_PDF_WIDTH)
+  })
+
+  it('caps below the old flat ceiling on a narrow window, so a drag cannot crush the editor', () => {
+    expect(maxPdfWidth(1280)).toBeLessThan(MAX_PDF_WIDTH)
+  })
+
+  it('never returns less than the column can legally be', () => {
+    // A 320px phone halves to 160, below MIN_PDF_WIDTH; an empty range would make
+    // the hook's clamp resolve min above max.
+    expect(maxPdfWidth(320)).toBe(MIN_PDF_WIDTH)
+    expect(maxPdfWidth(1)).toBe(MIN_PDF_WIDTH)
+  })
+
+  it('falls back to the flat ceiling when the window cannot be measured', () => {
+    // A server render or a test renderer with no layout reports 0.
+    expect(maxPdfWidth(0)).toBe(MAX_PDF_WIDTH)
+  })
+})
+
+describe('defaultPdfWidth', () => {
+  // `loadColumnWidth` returns its fallback UNCHANGED when the stored width is
+  // unusable, so the fallback has to be legal before it gets there — otherwise
+  // the very first render sits outside the range the grip announces.
+  it('leaves the chosen default alone once the window is wide enough to hold it', () => {
+    expect(defaultPdfWidth(1040)).toBe(DEFAULT_PDF_WIDTH)
+    expect(defaultPdfWidth(2560)).toBe(DEFAULT_PDF_WIDTH)
+  })
+
+  it.each([
+    [800, 400],
+    [900, 450],
+    [1000, 500],
+  ])('gives way to the ceiling on a %ipx window', (viewport, expected) => {
+    expect(defaultPdfWidth(viewport)).toBe(expected)
+  })
+
+  it('never exceeds the ceiling the grip advertises', () => {
+    // The defect this closes: a 769-1039px window advertised aria-valuemax
+    // 385-520 while rendering 520, so the reported position was out of range
+    // until the first drag pulled it back in.
+    for (let viewport = 700; viewport <= 1200; viewport += 1) {
+      expect(defaultPdfWidth(viewport)).toBeLessThanOrEqual(maxPdfWidth(viewport))
+    }
+  })
+
+  it('stays a legal column width on a viewport too small to halve', () => {
+    expect(defaultPdfWidth(320)).toBe(MIN_PDF_WIDTH)
+  })
+
+  it('keeps the chosen default when the window cannot be measured', () => {
+    expect(defaultPdfWidth(0)).toBe(DEFAULT_PDF_WIDTH)
   })
 })
