@@ -42,6 +42,7 @@ import {
   COLLAPSED_TREE_WIDTH,
   PDF_WIDTH_KEY, MIN_PDF_WIDTH, maxPdfWidth, defaultPdfWidth,
   CHAT_WIDTH_KEY, DEFAULT_CHAT_WIDTH, MIN_CHAT_WIDTH, MAX_CHAT_WIDTH, CHAT_OPEN_KEY,
+  maxChatWidth,
 } from './lib'
 import { loadColumnWidth, loadColumnCollapsed } from '../../lib/columnWidth'
 import { safeSetItem } from '../../utils/safeStorage'
@@ -201,10 +202,21 @@ export default function PapyrusPage() {
     PDF_WIDTH_KEY, loadPdfWidth, MIN_PDF_WIDTH, pdfMax,
     undefined, undefined, 'left',
   )
+  // The co-author ceiling tracks the room the tree and preview leave, so the
+  // panel yields instead of the editor. `tree.width` is already the strip width
+  // while collapsed, so collapsing the tree hands the room straight over.
+  const chatMax = maxChatWidth(viewportWidth, tree.width, pdf.width)
   const chat = useColumnResize(
-    CHAT_WIDTH_KEY, loadChatWidth, MIN_CHAT_WIDTH, MAX_CHAT_WIDTH,
+    CHAT_WIDTH_KEY, loadChatWidth, MIN_CHAT_WIDTH, chatMax,
     undefined, undefined, 'left',
   )
+  // The width RENDERED, which is not `chat.width`: the hook clamps only what a
+  // drag or an arrow key produces, so a width stored beside a narrow preview
+  // still arrives whole when the panel reopens beside a wide one. Applying the
+  // ceiling here is what covers the four ways the panel becomes visible — mount,
+  // the toolbar toggle, returning from a narrow viewport, switching paper — none
+  // of which is a drag.
+  const chatWidth = Math.min(chat.width, chatMax)
   const [slotKey, setSlotKey] = useState<string | null>(null)
   const [slotCreating, setSlotCreating] = useState(false)
   const [error, setError] = useState('')
@@ -1282,9 +1294,9 @@ export default function PapyrusPage() {
             handleProps={chat.handleProps}
             label={i18nT('pages.chat.sidePanel.resize_panel')}
             onNudge={chat.nudge}
-            value={chat.width}
+            value={chatWidth}
             min={MIN_CHAT_WIDTH}
-            max={MAX_CHAT_WIDTH}
+            max={chatMax}
           />
         )}
 
@@ -1294,7 +1306,7 @@ export default function PapyrusPage() {
             <motion.div
               key="co-author"
               initial={{ width: 0, opacity: 0 }}
-              animate={{ width: isMobile ? '100%' : chat.width, opacity: 1 }}
+              animate={{ width: isMobile ? '100%' : chatWidth, opacity: 1 }}
               exit={{ width: 0, opacity: 0 }}
               // No easing while dragging: the open/close animation would chase
               // every pointer move, so the panel lags the grip by ~180ms and the
@@ -1307,7 +1319,7 @@ export default function PapyrusPage() {
                   content-sized, so a percentage on the child alone resolves
                   against a box that hugs its own content -- the panel would come
                   out narrower than the pixel width it replaced, not wider. */}
-              <div style={{ width: isMobile ? '100%' : chat.width }} className="h-full min-h-0">
+              <div style={{ width: isMobile ? '100%' : chatWidth }} className="h-full min-h-0">
                 <CoAuthorPanel
                   slotKey={slotKey}
                   creating={slotCreating}

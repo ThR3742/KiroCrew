@@ -18,13 +18,16 @@
  * no accessible input under jsdom, `PdfPreview` fetches a blob URL, and
  * `CoAuthorPanel` mounts the whole ChatPage).
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import PapyrusPage from '../apps/papyrus/PapyrusPage'
 import { createTestStore, renderWithProviders } from './helpers'
 import { papyrusApi } from '../apps/papyrus/api'
-import { LAST_PROJECT_KEY } from '../apps/papyrus/lib'
+import {
+  CHAT_OPEN_KEY, CHAT_WIDTH_KEY, DEFAULT_PDF_WIDTH, DEFAULT_TREE_WIDTH,
+  LAST_PROJECT_KEY, MIN_CHAT_WIDTH, MIN_EDITOR_WIDTH,
+} from '../apps/papyrus/lib'
 
 vi.mock('../apps/papyrus/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../apps/papyrus/api')>()),
@@ -127,5 +130,73 @@ describe('papyrus resize grips report a position inside the range they advertise
     expect(collapsed.now, 'the 28px rail must not be announced below the minimum')
       .toBeGreaterThanOrEqual(collapsed.min)
     expect(collapsed.now).toBeLessThanOrEqual(collapsed.max)
+  })
+})
+
+/** The width actually applied to the co-author column, in px. */
+function chatBoxWidth(): number {
+  const box = screen.getByTestId('co-author-panel').parentElement
+  return parseFloat(box?.style.width ?? '')
+}
+
+const JSDOM_VIEWPORT = 1024
+const setViewport = (value: number) => {
+  Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value })
+}
+
+describe('the co-author panel yields width instead of the editor', () => {
+  afterEach(() => { setViewport(JSDOM_VIEWPORT) })
+
+  it('opens narrower than its stored width when the room does not hold it', async () => {
+    // 1600px: the tree and preview take 176 + 520 at their defaults, so 624px is
+    // all the panel may have if the editor keeps its 280px floor. A stored 700
+    // would have rendered whole — the panel is restored at mount here, which is
+    // the path a drag-time clamp alone would miss.
+    setViewport(1600)
+    localStorage.setItem(CHAT_OPEN_KEY, '1')
+    localStorage.setItem(CHAT_WIDTH_KEY, '700')
+    await openWorkspace()
+
+    const width = chatBoxWidth()
+    expect(width).toBe(624)
+    expect(1600 - DEFAULT_TREE_WIDTH - DEFAULT_PDF_WIDTH - width)
+      .toBeGreaterThanOrEqual(MIN_EDITOR_WIDTH)
+  })
+
+  it('keeps a stored width the room can hold', async () => {
+    // Same window, a width that fits: yielding must not become a permanent
+    // haircut, or the preference is lost rather than deferred.
+    setViewport(1600)
+    localStorage.setItem(CHAT_OPEN_KEY, '1')
+    localStorage.setItem(CHAT_WIDTH_KEY, '500')
+    await openWorkspace()
+
+    expect(chatBoxWidth()).toBe(500)
+  })
+
+  it('stops at its own minimum on a window too narrow to buy the floor back', async () => {
+    // jsdom's 1024px: 176 + 512 + 280 already exceeds what a 280px editor would
+    // leave, so the panel goes to its minimum and no further.
+    localStorage.setItem(CHAT_OPEN_KEY, '1')
+    localStorage.setItem(CHAT_WIDTH_KEY, '420')
+    await openWorkspace()
+
+    expect(chatBoxWidth()).toBe(MIN_CHAT_WIDTH)
+  })
+
+  it('announces a position inside the range the drag enforces', async () => {
+    // The ceiling moved, so the grip has to move with it: `aria-valuemax` is the
+    // room, not the flat 720 the column could once claim.
+    setViewport(1600)
+    localStorage.setItem(CHAT_OPEN_KEY, '1')
+    localStorage.setItem(CHAT_WIDTH_KEY, '700')
+    await openWorkspace()
+
+    const grips = splitters()
+    const chat = grips[grips.length - 1]
+    expect(chat.max).toBe(624)
+    expect(chat.now).toBe(624)
+    expect(chat.now).toBeGreaterThanOrEqual(chat.min)
+    expect(chat.now).toBeLessThanOrEqual(chat.max)
   })
 })

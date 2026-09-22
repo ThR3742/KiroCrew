@@ -57,10 +57,14 @@ describe('papyrus at phone widths', () => {
     // The motion wrapper is animated and content-sized. A percentage on the
     // child alone resolves against a box that hugs its content, so the panel
     // comes out NARROWER than the pixel width it replaced.
+    //
+    // Both read `chatWidth`, the width after the room-aware ceiling, rather than
+    // the hook's raw `chat.width`: a wrapper on one and the ceiling on the other
+    // would animate to a width the content box never takes.
     expect(s, 'the animated wrapper width must move')
-      .toMatch(/animate=\{\{ width: isMobile \? '100%' : chat\.width, opacity: 1 \}\}/)
+      .toMatch(/animate=\{\{ width: isMobile \? '100%' : chatWidth, opacity: 1 \}\}/)
     expect(s, 'the inner fixed width must move too')
-      .toMatch(/style=\{\{ width: isMobile \? '100%' : chat\.width \}\}/)
+      .toMatch(/style=\{\{ width: isMobile \? '100%' : chatWidth \}\}/)
     expect(s, 'the wrapper must own the pane while narrow')
       .toMatch(/isMobile \? 'flex-1' : 'shrink-0'/)
   })
