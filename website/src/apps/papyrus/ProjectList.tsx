@@ -213,8 +213,8 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
   /**
    * Open a paper, unless a rename is still open. Clicking another row blurs the
    * field, which starts the save — and leaving now would unmount this list, so
-   * a save that then failed would lose the draft it is meant to keep. The field
-   * closes on success, after which the click goes through.
+   * a save that then failed would lose the draft it is meant to keep. The click
+   * is discarded; once the field closes on success, the user clicks again.
    */
   const renameOpen = Boolean(renaming) || renameMutation.isPending
   // A row deleted while its field is open unmounts the field without a blur, so

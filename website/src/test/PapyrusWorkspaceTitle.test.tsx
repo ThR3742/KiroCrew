@@ -14,7 +14,7 @@
  * renders no accessible input under jsdom and the PDF pane fetches a blob URL.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, waitFor, within } from '@testing-library/react'
+import { cleanup, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import PapyrusPage from '../apps/papyrus/PapyrusPage'
 import { renderWithProviders } from './helpers'
@@ -79,13 +79,13 @@ beforeEach(() => {
 })
 
 describe('the toolbar of an open paper', () => {
-  it('names the paper by its title, not by the directory key', async () => {
+  it('names the paper by its title, or by the directory when the server sends none', async () => {
     const toolbar = await openWorkspace('MACKEREL')
     expect(toolbar.getByText('MACKEREL')).toBeInTheDocument()
     expect(toolbar.queryByText(DIR)).toBeNull()
-  })
+    cleanup()
+    localStorage.clear()
 
-  it('falls back to the directory when the server sends no title', async () => {
     // An older backend has no `title` field; a header must never read "undefined".
     api.listProjects.mockResolvedValue({
       projects: [{ name: DIR, title: DIR, modified: 0, has_pdf: false }],
@@ -96,9 +96,9 @@ describe('the toolbar of an open paper', () => {
     const user = userEvent.setup()
     renderWithProviders(<PapyrusPage />)
     await user.click(await screen.findByText(DIR))
-    const toolbar = within(await screen.findByTestId('papyrus-workspace'))
-    expect(toolbar.getByText(DIR)).toBeInTheDocument()
-    expect(toolbar.queryByText(/undefined/)).toBeNull()
+    const fallback = within(await screen.findByTestId('papyrus-workspace'))
+    expect(fallback.getByText(DIR)).toBeInTheDocument()
+    expect(fallback.queryByText(/undefined/)).toBeNull()
   })
 
   it('shows a rename without a page reload', async () => {

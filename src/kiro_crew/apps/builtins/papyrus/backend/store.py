@@ -42,8 +42,8 @@ from typing import Any
 from kiro_crew import platform_compat
 from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.hooks import safe_read_file_bytes_nolink
-from kiro_crew.security import is_sensitive_path
+from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
+from kiro_crew.security import is_sensitive_path, redact
 
 logger = logging.getLogger("kirocrew.app.papyrus")
 
@@ -51,6 +51,9 @@ APP_NAME = "papyrus"
 
 #: Per-project config file holding the chosen main ``.tex`` document.
 PROJECT_CONFIG_FILENAME = ".papyrus.json"
+# `.papyrus.json` holds a main-file name and a capped title; anything larger is
+# not a config this app wrote, and is read as absent rather than parsed.
+PROJECT_CONFIG_MAX_BYTES = 64 * 1024
 
 #: The document compiled when a project has no configured main file.
 DEFAULT_MAIN_FILE = "main.tex"
@@ -101,12 +104,21 @@ TITLE_SCAN_BYTES = 64 * 1024
 #: ``A \textbf{bold``. :func:`_braced_group` walks the braces instead.
 _RE_TITLE = re.compile(r"\\title\s*(?:\[(?P<short>[^\]]*)\])?\s*\{")
 
-#: A TeX comment: an unescaped ``%`` to end of line.
+#: A TeX comment: an unescaped ``%`` to end of line, WITH that line break and the
+#: next line's leading blanks — TeX drops all three, so ``AB%note`` then ``CD`` on
+#: the next line typesets ``ABCD``.
 #:
 #: Stripped before the title is looked for, because a commented-out alternative
 #: title above the real one is ordinary in a paper under revision, and taking it
-#: would show a title the document does not typeset.
-_RE_TEX_COMMENT = re.compile(r"(?<!\\)%.*?$", re.MULTILINE)
+#: would show a title the document does not typeset. The line break goes with it
+#: so text TeX joins stays joined for the redaction: left as a space, it would split
+#: a token into fragments the redactor does not recognize.
+#:
+#: A control symbol (``\%``, ``\\``) is matched first and kept as group 1, so a
+#: ``%`` counts as escaped only when a backslash pair does not consume the
+#: backslash before it: ``\\%note`` is a line break followed by a comment.
+#: Substitute with ``r"\1"``.
+_RE_TEX_COMMENT = re.compile(r"(\\[\s\S])|%[^\r\n]*(?:\r?\n[ \t]*)?")
 
 #: Groups dropped whole from a title: author-note commands whose content is
 #: never part of the title as typeset.
@@ -470,17 +482,24 @@ class TitleRejected(ValueError):
 
 
 class ConfigWriteRefused(Exception):
-    """``.papyrus.json`` exists as a link or outside the project, so it is not written.
+    """``.papyrus.json`` is a link, outside the project, unreadable or would exceed its cap.
 
-    Raised by the one caller whose success the user sees — a rename — instead of
-    answering "saved" over a write that never happened. :func:`set_main_file`
-    keeps the silent no-op: the compile path calls it implicitly and must not fail.
+    Raised by the callers whose success the user sees — a rename and ``PUT /main``
+    — instead of answering "saved" over a write that never happened. The compile
+    path ignores :func:`set_main_file`'s answer: it calls it implicitly and must
+    not fail.
     """
 
 
 # Weak values: a lock lives only while a writer holds it, so a deleted paper leaves
 # no entry behind. A concurrent writer still gets the SAME lock, because the one
 # holding it keeps it alive for as long as it matters.
+# Storing a bare `threading.Lock` here does NOT raise TypeError: `_thread.lock`
+# has a C-level weak-reference slot, so `weakref.ref(threading.Lock())` works on
+# every Python this package runs on (>= 3.12) even though the object exposes no
+# `__weakref__` attribute. The `_AgentLock` docstring in `subagent_persistence.py`
+# says otherwise; it is wrong, and no wrapper is needed. The route tests take these
+# locks on every rename, delete and main-file write, so a TypeError would fail them.
 _CONFIG_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
 _CONFIG_LOCKS_GUARD = threading.Lock()
 
@@ -514,14 +533,65 @@ def _config_lock(project: Path) -> threading.Lock:
         return _CONFIG_LOCKS.setdefault(key, threading.Lock())
 
 
+def _canonical_project_root(project: Path) -> Path:
+    """The admission root for a read inside *project*.
+
+    The projects dir (owned by Kiro Crew, resolved for a symlinked ancestor) plus
+    the entry name taken LITERALLY. Resolving the entry itself would let a project
+    directory swapped for a link redefine its own root.
+    """
+    return project.parent.resolve() / project.name
+
+
 def read_project_config(project: Path) -> dict[str, Any]:
-    """Read ``.papyrus.json``, returning ``{}`` when absent, corrupt or uncontained."""
+    """Read ``.papyrus.json``, returning ``{}`` when absent, corrupt, oversized or uncontained."""
+    try:
+        return _read_config_for_update(project)
+    except ConfigUnreadable:
+        return {}
+
+
+class ConfigUnreadable(Exception):
+    """``.papyrus.json`` exists but was not read (oversized or refused).
+
+    A writer must not take it for an empty config: rewriting it would discard
+    every key it holds.
+    """
+
+
+def _read_config_for_update(project: Path) -> dict[str, Any]:
+    """:func:`read_project_config` for a writer: ``{}`` ONLY when there is no file.
+
+    A file that exists but cannot be used raises :class:`ConfigUnreadable`. The
+    bytes are read through :func:`safe_read_file_bytes_nolink`, pinned to the
+    project root on the opened descriptor: `_config_path` refuses a link at the
+    name, but a pull can swap the file for one between that check and the read.
+    That read answers ``None`` for an absent file and for every refusal alike
+    (a hardlink, a descriptor it cannot verify), so the two are told apart here.
+    """
     path = _config_path(project)
-    if path is None or not path.is_file():
+    if path is None:
+        # A link or an uncontained name: `write_project_config` refuses it too.
         return {}
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        root = _canonical_project_root(project)
+        raw = safe_read_file_bytes_nolink(
+            str(path),
+            str(root),
+            max_bytes=PROJECT_CONFIG_MAX_BYTES,
+            within_root_is_canonical=True,
+        )
+    except (OSError, FileTooLargeError) as exc:
+        raise ConfigUnreadable(project.name) from exc
+    if raw is None:
+        if os.path.lexists(path):
+            raise ConfigUnreadable(project.name)
+        return {}
+    # Bytes that do not parse into an object hold no key to keep, so the writer
+    # starts from an empty config instead of refusing every write forever.
+    try:
+        loaded = json.loads(raw.decode("utf-8"))
+    except ValueError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
 
@@ -538,11 +608,23 @@ def write_project_config(project: Path, config: dict[str, Any]) -> bool:
     :func:`delete_project` would recreate the directory, and the deleted paper's
     name would stay taken. Callers hold :func:`_config_lock`, which the delete
     holds too, so the check and the write cannot straddle a removal.
+
+    Refuses a payload over the read cap too: it would save, then read back as absent.
     """
     path = _config_path(project)
     if path is None or not project.is_dir():
         return False
-    atomic_write(path, json.dumps(config, indent=2), fsync=True)
+    payload = json.dumps(config, indent=2)
+    if len(payload.encode("utf-8")) > PROJECT_CONFIG_MAX_BYTES:
+        return False
+    # This function calls atomic_write() with the full path
+    # projects/<id>/.papyrus.json. If another program replaced the
+    # projects/<id> folder with a symlink just before that call, the file
+    # would be written in the folder that symlink points to. Accepted:
+    # Papyrus never creates symlinks or moves folders, so only a program
+    # running as this same user could do it, and that program can already
+    # write .papyrus.json itself.
+    atomic_write(path, payload, fsync=True)
     return True
 
 
@@ -619,6 +701,15 @@ def _contained_file(project: Path, relative: str) -> bool:
 #: same name — exactly the replacement this has to tell apart.
 _GENERATIONS: dict[str, tuple[int, str]] = {}
 _GENERATIONS_GUARD = threading.Lock()
+#: Entry cap for :data:`_GENERATIONS`. A delete through Papyrus forgets its entry,
+#: but a directory removed outside it leaves one behind. At the cap, entries whose
+#: directory is gone (or holds another inode) are dropped first; if it is still
+#: full, a new paper gets no token rather than evicting one already handed out, so
+#: a listing never returns a row whose token it has just invalidated, and
+#: :func:`list_projects` leaves that paper out and logs how many it left out. Far
+#: above any real paper count. An entry is a path and a token, so the cap bounds
+#: the registry to a few megabytes.
+_MAX_GENERATIONS = 65536
 
 
 class ProjectReplaced(Exception):
@@ -633,6 +724,15 @@ def project_generation(project: Path) -> str:
     removed and recreated outside Papyrus. A restart forgets every token: a list
     loaded before it then has its rename refused, which is the safe failure (the
     client reloads the list and retries).
+
+    The inode alone cannot catch a removal outside Papyrus that the OS answers
+    with the SAME inode on the recreate. That is accepted: the token guards only
+    the display-only ``title`` key (``name`` stays every route's identifier), the
+    wrong name shows in the next list and is retyped or cleared with the same
+    route. Adding ctime to the identity, the obvious remedy, would be worse: a
+    directory's ctime moves whenever an entry in it is created, renamed or removed,
+    including the atomic write of ``.papyrus.json`` each rename does and the PDF
+    each first compile creates, so ordinary renames would be refused.
     """
     try:
         inode = project.stat().st_ino
@@ -642,9 +742,27 @@ def project_generation(project: Path) -> str:
     with _GENERATIONS_GUARD:
         entry = _GENERATIONS.get(key)
         if entry is None or entry[0] != inode:
+            if entry is None and len(_GENERATIONS) >= _MAX_GENERATIONS:
+                _drop_stale_generations_locked()
+                if len(_GENERATIONS) >= _MAX_GENERATIONS:
+                    return ""
             entry = (inode, secrets.token_hex(16))
             _GENERATIONS[key] = entry
         return entry[1]
+
+
+def _drop_stale_generations_locked() -> None:
+    """Forget entries whose directory is gone or holds another inode.
+
+    The caller holds :data:`_GENERATIONS_GUARD`. Runs only at the cap.
+    """
+    for key, (inode, _token) in list(_GENERATIONS.items()):
+        try:
+            if os.stat(key).st_ino == inode:
+                continue
+        except OSError:
+            pass
+        del _GENERATIONS[key]
 
 
 def _delete_locked(project: Path, lock: threading.Lock) -> bool:
@@ -665,13 +783,22 @@ def delete_project(project: Path) -> bool:
         return _delete_locked(project, lock)
 
 
-def set_main_file(project: Path, main_file: str) -> None:
-    """Set the main document (validated), preserving other config keys."""
+def set_main_file(project: Path, main_file: str) -> bool:
+    """Set the main document (validated), preserving other config keys.
+
+    Returns whether it was saved: ``False`` for a config that is a link, outside
+    the project or oversized. The compile path ignores the answer; ``PUT /main``
+    reports it.
+    """
     safe_child(project, main_file)
     with _config_lock(project):
-        config = read_project_config(project)
+        try:
+            config = _read_config_for_update(project)
+        except ConfigUnreadable:
+            logger.warning("papyrus: not rewriting an unreadable config in %s", project.name)
+            return False
         config["main_file"] = main_file
-        write_project_config(project, config)
+        return write_project_config(project, config)
 
 
 def _braced_group(text: str, open_brace: int) -> str | None:
@@ -704,14 +831,14 @@ def _braced_group(text: str, open_brace: int) -> str | None:
     return None
 
 
-def _flatten_tex(raw: str) -> str:
+def _flatten_tex(raw: str, markup: str = " ") -> str:
     """Reduce a title's LaTeX source to the words it typesets.
 
     Deliberately small: this renders nothing, it only removes the markup that
     would otherwise be READ ALOUD in a table cell (``\\textbf``, ``\\\\``, ``~``).
     Author notes are dropped with their content first — dropping the command
     alone would splice the note INTO the title — and :data:`_RE_TEX_TOKEN` then
-    does the rest in one pass.
+    does the rest in one pass, replacing each piece of markup with *markup*.
     """
     text = raw
     while (match := _RE_TITLE_NOTE.search(text)) is not None:
@@ -722,7 +849,18 @@ def _flatten_tex(raw: str) -> str:
         # `match.end()` is one past the opening brace, so the group's content
         # ends at `match.end() + len(group)` — the index OF the closing brace.
         text = text[: match.start()] + text[match.end() + len(group) + 1 :]
-    return _RE_TEX_TOKEN.sub(lambda m: m.group(1) or " ", text)
+    return _RE_TEX_TOKEN.sub(lambda m: m.group(1) or markup, text)
+
+
+def _displayable(flattened: str) -> str:
+    """Drop control/format characters and collapse whitespace (see :func:`sanitize_title`)."""
+    stripped = "".join(
+        " " if char in _WHITESPACE_CONTROLS
+        else char if unicodedata.category(char) not in ("Cc", "Cf")
+        else ""
+        for char in flattened
+    )
+    return re.sub(r"\s+", " ", stripped).strip()
 
 
 def sanitize_title(raw: str) -> str:
@@ -754,15 +892,19 @@ def sanitize_title(raw: str) -> str:
     # the token it split, leaving a credential prefix the redactor does not know.
     if len(raw) > _TITLE_INPUT_CHARS:
         return ""
-    flattened = _flatten_tex(raw)
-    stripped = "".join(
-        " " if char in _WHITESPACE_CONTROLS
-        else char if unicodedata.category(char) not in ("Cc", "Cf")
-        else ""
-        for char in flattened
-    )
-    collapsed = re.sub(r"\s+", " ", stripped).strip()
-    return collapsed
+    spaced = _displayable(_flatten_tex(raw))
+    # Markup inside a token (`AKIA\textbf{...}`, a `\\` break) flattens to a space
+    # and splits it into fragments the route's redaction does not recognize. When
+    # the closed-up form holds a credential, return THAT form, so the token reaches
+    # the redaction whole; otherwise the spaced form reads better.
+    # A configured title never went through the document's comment strip, so a `%`
+    # can split a token there too: probe it closed up both the way TeX reads it
+    # (the comment dropped) and with the bare `%` removed.
+    for probe in (raw, _RE_TEX_COMMENT.sub(r"\1", raw), raw.replace("%", "")):
+        joined = _displayable(_flatten_tex(probe, ""))
+        if joined != spaced and redact(joined) != joined:
+            return joined
+    return spaced
 
 
 def extract_title(project: Path, main_file: str) -> str:
@@ -778,8 +920,9 @@ def extract_title(project: Path, main_file: str) -> str:
     title is not mistaken for the live one.
     """
     try:
+        root = _canonical_project_root(project)
         path = safe_child(project, main_file)
-    except PathRejected:
+    except (OSError, PathRejected):
         logger.warning("papyrus: refused an uncontained main file in %s", project.name)
         return ""
     # Opened without following a link and checked against the project root on
@@ -787,13 +930,14 @@ def extract_title(project: Path, main_file: str) -> str:
     # `safe_child`, and the list would otherwise title a paper with outside text.
     raw = safe_read_file_bytes_nolink(
         str(path),
-        str(project.resolve()),
+        str(root),
         max_bytes=TITLE_SCAN_BYTES,
         allow_truncate=True,
+        within_root_is_canonical=True,
     )
     if raw is None:
         return ""
-    source = _RE_TEX_COMMENT.sub("", raw.decode("utf-8", errors="replace"))
+    source = _RE_TEX_COMMENT.sub(r"\1", raw.decode("utf-8", errors="replace"))
     match = _RE_TITLE.search(source)
     if match is None:
         return ""
@@ -835,19 +979,6 @@ def config_lock(project: Path) -> threading.Lock:
     return _config_lock(project)
 
 
-def set_project_title(project: Path, title: str) -> str:
-    """Set the display name under :func:`config_lock`, returning the resolved title.
-
-    Returns what the list will now show, so a caller does not have to re-resolve
-    it to answer the request. The resolution runs AFTER the lock is released:
-    :func:`resolve_main_file` can persist a main document, which takes the same
-    (non-reentrant) lock.
-    """
-    with _config_lock(project):
-        set_project_title_locked(project, title)
-    return project_title(project, resolve_main_file(project))
-
-
 def set_project_title_locked(project: Path, title: str) -> None:
     """Set (or clear) the user's display name; the caller holds :func:`config_lock`.
 
@@ -858,7 +989,10 @@ def set_project_title_locked(project: Path, title: str) -> None:
     cleaned = sanitize_title(title)
     if title.strip() and not cleaned:
         raise TitleRejected(project.name)
-    config = read_project_config(project)
+    try:
+        config = _read_config_for_update(project)
+    except ConfigUnreadable:
+        raise ConfigWriteRefused(project.name) from None
     if cleaned:
         config[PROJECT_TITLE_KEY] = cleaned
     else:
@@ -937,6 +1071,7 @@ def list_projects(root: Path | None = None) -> list[ProjectSummary]:
     Synchronous filesystem scan — call it off the event loop.
     """
     out: list[ProjectSummary] = []
+    no_token = 0
     for entry in sorted(projects_dir(root).iterdir()):
         # Same helper as `safe_project_dir`, which refuses a linked project entry
         # outright: a junction under `projects/` is a directory `is_symlink()`
@@ -950,6 +1085,7 @@ def list_projects(root: Path | None = None) -> list[ProjectSummary]:
         # shows the paper that replaced it.
         generation = project_generation(entry)
         if not generation:
+            no_token += 1
             continue
         main_file = resolve_main_file(entry)
         if main_file is None:
@@ -970,6 +1106,13 @@ def list_projects(root: Path | None = None) -> list[ProjectSummary]:
         if project_generation(entry) != generation:
             continue
         out.append(row)
+    if no_token:
+        logger.warning(
+            "papyrus: left %d paper(s) out of the list: no generation token "
+            "(unreadable directory, or the registry is at its cap of %d)",
+            no_token,
+            _MAX_GENERATIONS,
+        )
     return out
 
 

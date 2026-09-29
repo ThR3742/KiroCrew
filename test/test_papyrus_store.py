@@ -28,6 +28,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -186,6 +187,13 @@ class TestMainFile:
     def test_handles_a_corrupt_config(self, project: Path) -> None:
         (project / store.PROJECT_CONFIG_FILENAME).write_text("{not valid json", encoding="utf-8")
         assert store.get_main_file(project) == "main.tex"
+        # An oversized clone-supplied config reads as absent instead of raising.
+        oversized = json.dumps({"pad": "x" * store.PROJECT_CONFIG_MAX_BYTES})
+        (project / store.PROJECT_CONFIG_FILENAME).write_text(oversized, encoding="utf-8")
+        assert store.get_main_file(project) == "main.tex"
+        # ...and is not rewritten (which would discard its keys).
+        store.set_main_file(project, "main.tex")
+        assert (project / store.PROJECT_CONFIG_FILENAME).read_text(encoding="utf-8") == oversized
 
     def test_handles_a_non_object_config(self, project: Path) -> None:
         (project / store.PROJECT_CONFIG_FILENAME).write_text('["a list"]', encoding="utf-8")
@@ -287,53 +295,8 @@ class TestListProjects:
         (proj / "main.tex").write_text("", encoding="utf-8")
         payload = store.list_projects(data_root)[0].to_dict()
         assert set(payload) == {"name", "modified", "has_pdf", "title", "generation"}
-        # A paper with no `\title{}` still ships a displayable name, so the client
-        # can render `title` unconditionally.
         assert payload["title"] == "paper"
         assert payload["generation"]
-
-    def test_the_generation_changes_when_a_paper_is_deleted_and_recreated(
-        self, data_root: Path
-    ) -> None:
-        proj = store.projects_dir(data_root) / "paper"
-        proj.mkdir(parents=True)
-        before = store.project_generation(proj)
-        assert store.project_generation(proj) == before
-        store.delete_project(proj)
-        proj.mkdir()
-        assert store.project_generation(proj) != before
-
-    @requires_symlinks
-    def test_a_symlinked_spelling_of_a_paper_shares_its_generation(
-        self, tmp_path: Path, data_root: Path
-    ) -> None:
-        # The list walks the data home as built; a route resolves it. Behind a
-        # symlinked ancestor both must still name the same paper.
-        proj = store.projects_dir(data_root) / "paper"
-        proj.mkdir(parents=True)
-        alias = tmp_path / "alias"
-        alias.symlink_to(data_root, target_is_directory=True)
-        via_link = store.projects_dir(alias) / "paper"
-        assert store.project_generation(via_link) == store.project_generation(proj)
-        assert store.config_lock(via_link) is store.config_lock(proj)
-
-    def test_a_row_torn_by_a_delete_and_recreate_is_left_out(self, data_root: Path) -> None:
-        proj = store.projects_dir(data_root) / "paper"
-        proj.mkdir(parents=True)
-        (proj / "main.tex").write_text("", encoding="utf-8")
-        real = store.project_title
-
-        def replaced_mid_row(project: Path, main_file: str) -> str:
-            # The paper is deleted and created again while its row is being built.
-            title = real(project, main_file)
-            store.delete_project(project)
-            project.mkdir()
-            (project / "main.tex").write_text("", encoding="utf-8")
-            return title
-
-        with mock.patch.object(store, "project_title", replaced_mid_row):
-            assert store.list_projects(data_root) == []
-        assert [p.name for p in store.list_projects(data_root)] == ["paper"]
 
 
 class TestFileIO:
@@ -1000,270 +963,204 @@ class TestTheWalkAndTheScanRefuseJunctionsToo:
 
 
 class TestPaperTitle:
-    """What the paper list CALLS a project: user name, then ``\\title{}``, then the dir.
+    """What the list CALLS a paper: user name, then ``\\title{}``, then the directory."""
 
-    The directory name stays the identifier throughout — every assertion here is
-    about the displayed string, and none of them renames a directory.
-    """
-
-    def _paper(self, data_root: Path, source: str, name: str = "62f1a9c3") -> Path:
-        proj = store.projects_dir(data_root) / name
+    def test_the_title_is_read_from_the_document(
+        self, data_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        proj = store.projects_dir(data_root) / "p"
         proj.mkdir(parents=True)
-        (proj / "main.tex").write_text(source, encoding="utf-8")
-        return proj
+        cases = [
+            (r"\documentclass{article}", "p"),
+            ("\\title{When Peers Disagree}\n", "When Peers Disagree"),
+            (r"\title{A \textbf{bold} claim}", "A bold claim"),
+            (r"\title[Papyrus]{Papyrus: a LaTeX workspace}", "Papyrus"),
+            ("% \\title{Last year}\n\\title{This year}\n", "This year"),
+            (r"\title{Coverage at 90\% and above}", "Coverage at 90% and above"),
+            (r"\title{MACKEREL\thanks{Work done at Amazon}}", "MACKEREL"),
+            (r"\title{Attention\footnote{Equal}: A Survey}", "Attention: A Survey"),
+            (r"\title{Multi\thanks{x}task}", "Multitask"),
+            ("\\title{One line\\\\\n  and a second}", "One line and a second"),
+            (r"\title{never closed", "p"),
+        ]
+        for source, expected in cases:
+            (proj / "main.tex").write_text(source, encoding="utf-8")
+            assert store.project_title(proj, "main.tex") == expected, source
+
+        (proj / "main.tex").write_text(r"\title{Calibrating}", encoding="utf-8")
+        (summary,) = store.list_projects(data_root)
+        assert (summary.name, summary.title) == ("p", "Calibrating")
+
+        # The read is bounded, so a title below the scan window is not seen.
+        monkeypatch.setattr(store, "TITLE_SCAN_BYTES", 32)
+        (proj / "main.tex").write_text("%" + "-" * 80 + "\n\\title{Too far}", encoding="utf-8")
+        assert store.project_title(proj, "main.tex") == "p"
+
+    def test_an_untrusted_title_is_cleaned(self, data_root: Path) -> None:
+        proj = store.projects_dir(data_root) / "cloned"
+        proj.mkdir(parents=True)
+        (proj / "main.tex").write_text("", encoding="utf-8")
+        cases: list[tuple[object, str]] = [
+            ("paper\u202egnp.txt", "papergnp.txt"),
+            ("first\nsecond\r\nthird", "first second third"),
+            ("\u200b \t ", "cloned"),
+            ({"nested": "object"}, "cloned"),
+            ("A" * 4000, "A" * 4000),  # the display cap is the route's, after redaction
+        ]
+        for configured, expected in cases:
+            store.write_project_config(proj, {"title": configured})
+            assert store.project_title(proj, "main.tex") == expected, configured
+
+        store.write_project_config(proj, {"title": "Kept"})
+        with pytest.raises(store.TitleRejected), store.config_lock(proj):
+            store.set_project_title_locked(proj, "\\LaTeX")
+        assert store.read_project_config(proj)["title"] == "Kept"
+
+        started = time.monotonic()
+        assert store.sanitize_title("\\thanks{x}" * 1_000_000) == ""
+        assert time.monotonic() - started < 2
 
     @requires_symlinks
-    def test_main_tex_swapped_for_a_link_after_the_check_is_not_followed(
-        self, data_root: Path, tmp_path: Path
+    def test_no_title_read_follows_a_link(
+        self, data_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A pull can replace `main.tex` with a symlink between `safe_child` and the read."""
-        proj = self._paper(data_root, r"\title{Inside}")
-        outside = tmp_path / "outside.tex"
-        outside.write_text(r"\title{Outside text}", encoding="utf-8")
-        real = store.safe_child
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "main.tex").write_text(r"\title{Exfiltrated}", encoding="utf-8")
+        (outside / "config.json").write_text(json.dumps({"title": "Exfiltrated"}), encoding="utf-8")
+        proj = store.projects_dir(data_root) / "paper"
+        proj.mkdir(parents=True)
+        (proj / "main.tex").write_text(r"\title{Inside}", encoding="utf-8")
+
+        # A linked main file.
+        os.symlink(outside / "main.tex", proj / "paper.tex")
+        assert store.extract_title(proj, "paper.tex") == ""
+
+        # `main.tex` swapped for a link after `safe_child` checked it.
+        real_safe_child = store.safe_child
 
         def check_then_swap(project: Path, relative: str) -> Path:
-            checked = real(project, relative)
+            checked = real_safe_child(project, relative)
             checked.unlink()
-            os.symlink(outside, checked)
+            os.symlink(outside / "main.tex", checked)
             return checked
 
         with mock.patch.object(store, "safe_child", check_then_swap):
             assert store.extract_title(proj, "main.tex") == ""
 
-    def test_falls_back_to_the_directory_name(self, data_root: Path) -> None:
-        proj = self._paper(data_root, r"\documentclass{article}")
-        assert store.project_title(proj, "main.tex") == "62f1a9c3"
+        # The project directory itself swapped for a link.
+        make_dir_link(store.projects_dir(data_root) / "swapped", outside)
+        assert store.extract_title(store.projects_dir(data_root) / "swapped", "main.tex") == ""
 
-    def test_reads_the_documents_own_title(self, data_root: Path) -> None:
-        proj = self._paper(
-            data_root, "\\documentclass{article}\n\\title{When Peers Disagree}\n"
-        )
-        assert store.project_title(proj, "main.tex") == "When Peers Disagree"
+        # `.papyrus.json` swapped for a link after `_config_path` checked it.
+        config = proj / store.PROJECT_CONFIG_FILENAME
+        os.symlink(outside / "config.json", config)
+        monkeypatch.setattr(store, "_config_path", lambda _project: config)
+        assert store.read_project_config(proj) == {}
 
-    def test_keeps_a_title_that_carries_its_own_groups(self, data_root: Path) -> None:
-        """The brace walker's reason to exist: ``[^}]*`` truncates at ``\\textbf{``."""
-        proj = self._paper(data_root, r"\title{A \textbf{bold} claim}")
-        assert store.project_title(proj, "main.tex") == "A bold claim"
-
-    def test_prefers_a_beamer_short_title(self, data_root: Path) -> None:
-        proj = self._paper(data_root, r"\title[Papyrus]{Papyrus: a LaTeX workspace}")
-        assert store.project_title(proj, "main.tex") == "Papyrus"
-
-    def test_ignores_a_commented_out_title(self, data_root: Path) -> None:
-        """A revised paper keeps its old title one line up, behind a ``%``."""
-        proj = self._paper(data_root, "% \\title{Last year's title}\n\\title{This year}\n")
-        assert store.project_title(proj, "main.tex") == "This year"
-
-    def test_an_escaped_percent_is_not_a_comment(self, data_root: Path) -> None:
-        """``\\%`` is title text, not a comment — and not a one-letter command."""
-        proj = self._paper(data_root, r"\title{Coverage at 90\% and above}")
-        assert store.project_title(proj, "main.tex") == "Coverage at 90% and above"
-
-    def test_drops_an_author_note_with_its_content(self, data_root: Path) -> None:
-        proj = self._paper(data_root, r"\title{MACKEREL\thanks{Work done at Amazon}}")
-        assert store.project_title(proj, "main.tex") == "MACKEREL"
-
-    def test_a_note_mid_title_leaves_no_trace(self, data_root: Path) -> None:
-        """The text after a note resumes AFTER its closing brace, not on it."""
-        proj = self._paper(data_root, r"\title{Attention\footnote{Equal}: A Survey}")
-        assert store.project_title(proj, "main.tex") == "Attention: A Survey"
-
-    def test_a_note_between_two_words_joins_them(self, data_root: Path) -> None:
-        proj = self._paper(data_root, r"\title{Multi\thanks{x}task}")
-        assert store.project_title(proj, "main.tex") == "Multitask"
-
-    def test_collapses_a_two_line_title(self, data_root: Path) -> None:
-        proj = self._paper(data_root, "\\title{One line\\\\\n  and a second}")
-        assert store.project_title(proj, "main.tex") == "One line and a second"
-
-    def test_a_title_past_the_scan_window_is_not_read(
-        self, data_root: Path, monkeypatch: pytest.MonkeyPatch
+    def test_paper_state_survives_deletes_and_races(
+        self, data_root: Path, tmp_path: Path
     ) -> None:
-        """The bounded read is what keeps listing N papers off an unbounded scan."""
-        monkeypatch.setattr(store, "TITLE_SCAN_BYTES", 32)
-        proj = self._paper(data_root, "%" + "-" * 80 + "\n\\title{Too far down}\n")
-        assert store.project_title(proj, "main.tex") == "62f1a9c3"
+        def paper(name: str) -> Path:
+            proj = store.projects_dir(data_root) / name
+            proj.mkdir(parents=True)
+            (proj / "main.tex").write_text("\\documentclass{article}", encoding="utf-8")
+            return proj
 
-    def test_the_user_name_outranks_the_document_title(self, data_root: Path) -> None:
-        """The whole point of a rename: it must win on a paper that HAS a title."""
-        proj = self._paper(data_root, r"\title{Multi-task Classification for Keywords}")
-        assert store.set_project_title(proj, "MACKEREL") == "MACKEREL"
-        assert store.project_title(proj, "main.tex") == "MACKEREL"
+        # A generation is stable, changes when the paper is replaced, and is shared
+        # with a spelling of the same paper behind a linked ancestor.
+        proj = paper("paper")
+        before = store.project_generation(proj)
+        assert store.project_generation(proj) == before
+        make_dir_link(tmp_path / "alias", data_root)
+        via_link = store.projects_dir(tmp_path / "alias") / "paper"
+        assert store.project_generation(via_link) == before
+        assert store.config_lock(via_link) is store.config_lock(proj)
+        store.delete_project(proj)
+        proj = paper("paper")
+        assert store.project_generation(proj) != before
 
-    def test_clearing_the_user_name_restores_the_document_title(
-        self, data_root: Path
-    ) -> None:
-        proj = self._paper(data_root, r"\title{The declared one}")
-        store.set_project_title(proj, "Renamed")
-        assert store.set_project_title(proj, "  ") == "The declared one"
-        assert store.PROJECT_TITLE_KEY not in store.read_project_config(proj)
+        # The registry is capped. A full registry first forgets entries whose
+        # folder is gone, then refuses a new paper instead of evicting a token it
+        # already handed out, so a listing never invalidates a row it returns.
+        store._GENERATIONS.clear()
+        current = store.project_generation(proj)
+        with mock.patch.object(store, "_MAX_GENERATIONS", 2):
+            other_gen = store.project_generation(other := paper("other"))
+            assert store.project_generation(third := paper("third")) == ""
+            assert store.project_generation(proj) == current
+            assert store.project_generation(other) == other_gen
+            assert "third" not in {row.name for row in store.list_projects(data_root)}
+            shutil.rmtree(other)  # removed outside Papyrus
+            assert store.project_generation(third) != ""
+        store.delete_project(third)
+        # A row torn by a delete and recreate while it is built is left out.
+        real_title = store.project_title
 
-    def test_renaming_preserves_the_rest_of_the_config(self, data_root: Path) -> None:
-        proj = self._paper(data_root, r"\title{x}")
-        store.set_main_file(proj, "main.tex")
-        store.set_project_title(proj, "Renamed")
-        assert store.read_project_config(proj)["main_file"] == "main.tex"
+        def replaced_mid_row(project: Path, main_file: str) -> str:
+            title = real_title(project, main_file)
+            store.delete_project(project)
+            paper(project.name)
+            return title
 
-    def test_renaming_never_touches_the_directory(self, data_root: Path) -> None:
-        proj = self._paper(data_root, r"\title{x}")
-        store.set_project_title(proj, "A friendly name")
-        assert proj.is_dir()
-        assert [p.name for p in store.list_projects(data_root)] == ["62f1a9c3"]
+        with mock.patch.object(store, "project_title", replaced_mid_row):
+            assert store.list_projects(data_root) == []
+        assert [p.name for p in store.list_projects(data_root)] == ["paper"]
 
-    def test_the_list_carries_the_resolved_title(self, data_root: Path) -> None:
-        self._paper(data_root, r"\title{Calibrating Peer Review}")
-        (summary,) = store.list_projects(data_root)
-        assert (summary.name, summary.title) == ("62f1a9c3", "Calibrating Peer Review")
-
-
-class TestConfigWritesDoNotLoseEachOther:
-    """Two mutators each read the whole config and write it back.
-
-    Unserialized, a title rename and a main-document change racing between read
-    and write both start from the same stale file, and the later write silently
-    drops the other's key.
-    """
-
-    def test_an_unused_lock_is_forgotten(self, data_root: Path) -> None:
-        """A deleted paper must not leave its lock in the registry for good."""
-        proj = store.projects_dir(data_root) / "gone"
-        proj.mkdir(parents=True)
-        (proj / "main.tex").write_text("\\documentclass{article}", encoding="utf-8")
-        store.set_project_title(proj, "Once")
-        gc.collect()
-        assert str(proj) not in store._CONFIG_LOCKS
-
-    def test_concurrent_title_and_main_file_both_persist(self, data_root: Path) -> None:
-        proj = store.projects_dir(data_root) / "race"
-        proj.mkdir(parents=True)
-        (proj / "main.tex").write_text("\\documentclass{article}", encoding="utf-8")
-        (proj / "other.tex").write_text("\\documentclass{article}", encoding="utf-8")
-
+        # A title rename and a main-file change racing between read and write both land.
+        paper("race")
+        race = store.projects_dir(data_root) / "race"
+        (race / "other.tex").write_text("", encoding="utf-8")
         real_read = store.read_project_config
+        real_read_for_update = store._read_config_for_update
         both_read = threading.Barrier(2, timeout=0.5)
 
         def slow_read(project: Path) -> dict:
-            config = real_read(project)
-            # Hold each reader until the other has read too. Serialized, the second
-            # never arrives inside the window; the barrier times out and it goes on.
+            config = real_read_for_update(project)
             try:
                 both_read.wait()
             except threading.BrokenBarrierError:
-                pass
+                pass  # serialized: the second reader never enters the window
             return config
 
-        with mock.patch.object(store, "read_project_config", slow_read):
+        def rename(project: Path, title: str) -> None:
+            with store.config_lock(project):
+                store.set_project_title_locked(project, title)
+
+        with mock.patch.object(store, "_read_config_for_update", slow_read):
             workers = [
-                threading.Thread(target=store.set_project_title, args=(proj, "Named")),
-                threading.Thread(target=store.set_main_file, args=(proj, "other.tex")),
+                threading.Thread(target=rename, args=(race, "Named")),
+                threading.Thread(target=store.set_main_file, args=(race, "other.tex")),
             ]
             for worker in workers:
                 worker.start()
             for worker in workers:
                 worker.join(5)
+        config = real_read(race)
+        assert (config.get("title"), config.get("main_file")) == ("Named", "other.tex")
 
-        config = real_read(proj)
-        assert config.get(store.PROJECT_TITLE_KEY) == "Named"
-        assert config.get("main_file") == "other.tex"
-
-
-class TestPaperTitleIsUntrusted:
-    """Both title sources arrive with ``POST /projects/clone``, so both are hostile.
-
-    ``.papyrus.json`` is a file a cloned repository can ship — the same reason
-    ``get_main_file`` re-validates its ``main_file`` — and a ``.tex`` is authored
-    outside this app in every case.
-    """
-
-    def _paper(self, data_root: Path, config: dict[str, object]) -> Path:
-        proj = store.projects_dir(data_root) / "cloned"
-        proj.mkdir(parents=True)
-        (proj / "main.tex").write_text("", encoding="utf-8")
-        store.write_project_config(proj, config)
-        return proj
-
-    def test_a_bidi_override_is_stripped(self, data_root: Path) -> None:
-        """A format char in a name reorders the whole row for every reader."""
-        proj = self._paper(data_root, {"title": "paper\u202egnp.txt"})
-        assert store.project_title(proj, "main.tex") == "papergnp.txt"
-
-    def test_a_newline_cannot_break_out_of_the_row(self, data_root: Path) -> None:
-        proj = self._paper(data_root, {"title": "first\nsecond\r\nthird"})
-        assert store.project_title(proj, "main.tex") == "first second third"
-
-    def test_a_huge_title_of_notes_is_handled_in_bounded_time(self) -> None:
-        """Clone-supplied and unbounded; stripping notes one by one is quadratic."""
-        started = time.monotonic()
-        assert store.sanitize_title("\\thanks{x}" * 1_000_000) == ""
-        assert time.monotonic() - started < 2
-
-    def test_a_write_refused_at_write_time_is_not_a_saved_rename(
-        self, data_root: Path
-    ) -> None:
-        """A link planted after the pre-check is refused by the writer itself."""
-        proj = self._paper(data_root, {})
+        # A refused write is not a saved rename, nor a saved main document.
         with mock.patch.object(store, "write_project_config", return_value=False):
             with pytest.raises(store.ConfigWriteRefused):
-                store.set_project_title(proj, "New name")
+                rename(race, "New name")
+            assert store.set_main_file(race, "main.tex") is False
 
-    def test_a_config_write_after_a_delete_does_not_recreate_the_paper(
-        self, data_root: Path
-    ) -> None:
-        proj = self._paper(data_root, {})
-        assert store.delete_project(proj)
-        assert store.write_project_config(proj, {"title": "late"}) is False
-        assert not proj.exists()
-
-    def test_a_delete_waits_for_a_config_write_in_flight(self, data_root: Path) -> None:
-        """Without the shared lock a rename's write can land after the removal."""
-        proj = self._paper(data_root, {})
-        lock = store._config_lock(proj)
+        # A delete waits for a write in flight, and a late write never recreates it.
+        lock = store.config_lock(race)
         lock.acquire()
-        worker = threading.Thread(target=store.delete_project, args=(proj,))
+        worker = threading.Thread(target=store.delete_project, args=(race,))
         worker.start()
         try:
             time.sleep(0.2)
-            assert proj.exists()
+            assert race.exists()
         finally:
             lock.release()
             worker.join(timeout=5)
-        assert not proj.exists()
+        assert not race.exists()
+        assert store.write_project_config(race, {"title": "late"}) is False
+        assert not race.exists()
 
-    def test_a_markup_only_rename_is_refused_not_read_as_a_clear(
-        self, data_root: Path
-    ) -> None:
-        proj = self._paper(data_root, {"title": "Kept"})
-        with pytest.raises(store.TitleRejected):
-            store.set_project_title(proj, "\\LaTeX")
-        assert store.read_project_config(proj)["title"] == "Kept"
-
-    def test_the_store_leaves_the_display_cap_to_the_route(self, data_root: Path) -> None:
-        """Cutting before redaction can split a credential; the route cuts after."""
-        proj = self._paper(data_root, {"title": "A" * 4000})
-        assert len(store.project_title(proj, "main.tex")) == 4000
-
-    def test_a_blank_configured_title_falls_through(self, data_root: Path) -> None:
-        """An empty override must not blank the row."""
-        proj = self._paper(data_root, {"title": "\u200b \t "})
-        assert store.project_title(proj, "main.tex") == "cloned"
-
-    def test_a_non_string_configured_title_is_ignored(self, data_root: Path) -> None:
-        proj = self._paper(data_root, {"title": {"nested": "object"}})
-        assert store.project_title(proj, "main.tex") == "cloned"
-
-    def test_an_unbalanced_title_group_yields_no_title(self, data_root: Path) -> None:
-        proj = store.projects_dir(data_root) / "truncated"
-        proj.mkdir(parents=True)
-        (proj / "main.tex").write_text(r"\title{never closed", encoding="utf-8")
-        assert store.project_title(proj, "main.tex") == "truncated"
-
-    @requires_symlinks
-    def test_a_linked_main_file_is_not_read_for_a_title(self, data_root: Path) -> None:
-        """Same containment as every other read here: the link is the whole trick."""
-        outside = data_root.parent / "secret.tex"
-        outside.write_text(r"\title{Exfiltrated}", encoding="utf-8")
-        proj = store.projects_dir(data_root) / "linked"
-        proj.mkdir(parents=True)
-        (proj / "paper.tex").symlink_to(outside)
-        assert store.extract_title(proj, "paper.tex") == ""
+        # A deleted paper does not keep its lock in the registry.
+        del lock
+        gc.collect()
+        assert str(race) not in store._CONFIG_LOCKS
