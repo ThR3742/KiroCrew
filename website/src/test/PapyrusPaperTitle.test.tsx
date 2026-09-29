@@ -1,23 +1,16 @@
 /**
  * What the paper list CALLS a paper, and the rename that overrides it.
  *
- * A cloned paper's directory is named after the clone URL's last segment, which
- * for Overleaf is the project id — so the list read `6a16ddbf` where the document
- * says "MACKEREL". The row now shows the resolved title with that identifier kept
- * underneath, because the identifier is what every route, the PDF URL and the
- * paper's chat slot are keyed on.
- *
- * The rename is asserted through the DOM rather than on the handler, because the
- * two defects this interaction invites are both invisible to a unit call: an
- * Escape that saves the draft it just abandoned (the blur it causes would commit),
- * and a cleared field that sends nothing (clearing the override is the only way
- * back to the document's own title).
+ * Asserted through the DOM: the defects this field invites (an Escape that saves
+ * through its own blur, a cleared field that sends nothing) are invisible to a
+ * unit call on the handler.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ProjectList from '../apps/papyrus/ProjectList'
 import { renderWithProviders } from './helpers'
+import { PROJECTS_QUERY_KEY } from '../apps/papyrus/lib'
 import { papyrusApi, type Project } from '../apps/papyrus/api'
 
 vi.mock('../apps/papyrus/api', async (importOriginal) => ({
@@ -53,268 +46,145 @@ function mount(projects: Project[], onOpenProject: (name: string) => void = () =
 
 /** The row's own scope, so a title assertion cannot match the page header. */
 async function row(displayed: string): Promise<HTMLElement> {
-  const cell = await screen.findByText(displayed)
-  const tr = cell.closest('tr')
-  expect(tr).not.toBeNull()
-  return tr as HTMLElement
+  return (await screen.findByText(displayed)).closest('tr') as HTMLElement
 }
 
-/**
- * The rename control, by its EXACT accessible name.
- *
- * A substring match on the title is ambiguous: the title itself is a `Clickable`,
- * which carries `role="button"` with the title as its accessible name, so
- * `/MACKEREL/` matches the row's open-the-paper control too.
- */
-function renameButton(tr: HTMLElement, displayed: string): HTMLElement {
-  return within(tr).getByRole('button', { name: `Rename ${displayed}` })
+/** Open the rename field of the row showing `displayed`, and return the field. */
+async function openRename(displayed: string): Promise<HTMLElement> {
+  const tr = await row(displayed)
+  // The exact name: the title itself is a button too, named after the title.
+  await userEvent.click(within(tr).getByRole('button', { name: `Rename ${displayed}` }))
+  return screen.getByLabelText('Paper name')
 }
+
+const closed = () => waitFor(() => expect(screen.queryByLabelText('Paper name')).toBeNull())
 
 beforeEach(() => {
   vi.clearAllMocks()
   mocked.health.mockResolvedValue({ status: 'ok', compiler: 'pdflatex', git: true })
-  mocked.setTitle.mockResolvedValue({ ok: true, title: 'ignored' })
 })
 
-describe('the name a paper is listed under', () => {
-  it('shows the resolved title, not the directory', async () => {
-    mount([project('6a16ddbf', 'MACKEREL: Multi-task Classification')])
-    const tr = await row('MACKEREL: Multi-task Classification')
-    expect(within(tr).getByText('6a16ddbf')).toBeInTheDocument()
-  })
-
-  it('lets an unbroken title wrap, so the row actions stay on a narrow screen', async () => {
-    /** Only `anywhere` lowers the cell's min-content width; measured in Chromium at 320px. */
+describe('the paper list', () => {
+  it('lists a paper under its title, with the directory under it', async () => {
     const long = 'A'.repeat(120)
-    mount([project('6a16ddbf', long)])
+    const legacy = { name: 'no-title-field', modified: 1, has_pdf: false } as Project
+    mount([project('6a16ddbf', 'MACKEREL'), project('my-paper', 'my-paper'), project('long', long), legacy])
+    expect(within(await row('MACKEREL')).getByText('6a16ddbf')).toBeInTheDocument()
+    // No title: the directory once, not twice.
+    expect(within(await row('my-paper')).getAllByText('my-paper')).toHaveLength(1)
+    // An older backend sends no `title`: the row still reads.
+    expect(await screen.findByText('no-title-field')).toBeInTheDocument()
+    // An unbroken title may wrap anywhere, so the row actions stay on a narrow screen.
     expect((await screen.findByText(long)).className).toContain('[overflow-wrap:anywhere]')
   })
 
-  it('keeps the identifier visible under the title', async () => {
-    /** It is the string you need to find the paper again on the host it came from. */
-    mount([project('62f1a9c3', 'When Peers Disagree')])
-    const tr = await row('When Peers Disagree')
-    expect(within(tr).getByText('62f1a9c3')).toBeInTheDocument()
-  })
+  it('renames through the field: Enter and blur save, Escape and an untouched seed do not', async () => {
+    mocked.setTitle.mockResolvedValue({ ok: true, title: 'Before' })
+    mount([project('6a16ddbf', 'Before')])
 
-  it('does not print the same name twice when there is no title', async () => {
-    mount([project('my-paper', 'my-paper')])
-    const tr = await row('my-paper')
-    expect(within(tr).getAllByText('my-paper')).toHaveLength(1)
-  })
+    // Seeded with the displayed name; leaving it untouched writes nothing, so a
+    // document title is never pinned as an override.
+    let field = await openRename('Before')
+    expect(field).toHaveValue('Before')
+    await userEvent.tab()
+    await closed()
 
-  it('renders the directory when a backend sends no title at all', async () => {
-    // An older backend has no `title` field; the row must still be readable.
-    const legacy = { name: 'no-title-field', modified: 1, has_pdf: false } as Project
-    mount([legacy])
-    expect(await screen.findByText('no-title-field')).toBeInTheDocument()
-  })
-})
-
-describe('renaming a paper', () => {
-  it('seeds the field with what the row currently displays', async () => {
-    mount([project('6a16ddbf', 'MACKEREL: Multi-task Classification')])
-    const tr = await row('MACKEREL: Multi-task Classification')
-    await userEvent.click(renameButton(tr, 'MACKEREL: Multi-task Classification'))
-    expect(screen.getByLabelText('Paper name')).toHaveValue(
-      'MACKEREL: Multi-task Classification',
-    )
-  })
-
-  it('saves the typed name on Enter', async () => {
-    mount([project('6a16ddbf', 'Multi-task Classification for Keyword Expansion')])
-    const tr = await row('Multi-task Classification for Keyword Expansion')
-    await userEvent.click(
-      renameButton(tr, 'Multi-task Classification for Keyword Expansion'),
-    )
-    const field = screen.getByLabelText('Paper name')
-    await userEvent.clear(field)
-    await userEvent.type(field, 'MACKEREL{Enter}')
-    await waitFor(() => expect(mocked.setTitle).toHaveBeenCalledWith('6a16ddbf', 'MACKEREL', 'gen-6a16ddbf'))
-  })
-
-  it('sends an empty title when the field is cleared, to restore the document title', async () => {
-    /** Clearing the override is the ONLY way back, so a blank submit must be sent. */
-    mount([project('6a16ddbf', 'A name someone set')])
-    const tr = await row('A name someone set')
-    await userEvent.click(renameButton(tr, 'A name someone set'))
-    const field = screen.getByLabelText('Paper name')
-    await userEvent.clear(field)
-    await userEvent.type(field, '{Enter}')
-    await waitFor(() => expect(mocked.setTitle).toHaveBeenCalledWith('6a16ddbf', '', 'gen-6a16ddbf'))
-  })
-
-  it('discards the draft on Escape', async () => {
-    /**
-     * Escape must not save, and the row commits on BLUR so a click-away is not
-     * lost — two rules that collide if the abandoned field's teardown ever emits
-     * a blur. Asserting no call is the only way to see that collision.
-     */
-    mount([project('6a16ddbf', 'Keep this one')])
-    const tr = await row('Keep this one')
-    await userEvent.click(renameButton(tr, 'Keep this one'))
-    const field = screen.getByLabelText('Paper name')
+    field = await openRename('Before')
     await userEvent.clear(field)
     await userEvent.type(field, 'Rejected{Escape}')
-    await waitFor(() => expect(screen.queryByLabelText('Paper name')).toBeNull())
+    await closed()
     expect(mocked.setTitle).not.toHaveBeenCalled()
-  })
 
-  it('saves on click-away, so a rename is not silently lost', async () => {
-    mount([project('6a16ddbf', 'Before')])
-    const tr = await row('Before')
-    await userEvent.click(renameButton(tr, 'Before'))
-    const field = screen.getByLabelText('Paper name')
+    field = await openRename('Before')
     await userEvent.clear(field)
     await userEvent.type(field, 'After')
     await userEvent.tab()
     await waitFor(() => expect(mocked.setTitle).toHaveBeenCalledWith('6a16ddbf', 'After', 'gen-6a16ddbf'))
-  })
+    await closed()
 
-  it('writes nothing when the field is left untouched', async () => {
-    /**
-     * The field opens seeded with the displayed name — usually the document's own
-     * `\title{}`. Saving that on blur would pin it as a user override, and later
-     * edits to the document's title would silently stop showing.
-     */
-    mount([project('6a16ddbf', 'Declared in the document')])
-    const tr = await row('Declared in the document')
-    await userEvent.click(renameButton(tr, 'Declared in the document'))
-    await userEvent.tab()
-    await waitFor(() => expect(screen.queryByLabelText('Paper name')).toBeNull())
-    expect(mocked.setTitle).not.toHaveBeenCalled()
-  })
-
-  it('keeps the typed name when the rename fails', async () => {
-    mocked.setTitle.mockRejectedValue(new Error('write refused'))
-    mount([project('6a16ddbf', 'Before')])
-    const tr = await row('Before')
-    await userEvent.click(renameButton(tr, 'Before'))
-    const field = screen.getByLabelText('Paper name')
+    // Clearing the field is the way back to the document's title, so it is sent.
+    field = await openRename('Before')
     await userEvent.clear(field)
+    await userEvent.type(field, '{Enter}')
+    await waitFor(() => expect(mocked.setTitle).toHaveBeenLastCalledWith('6a16ddbf', '', 'gen-6a16ddbf'))
+  })
+
+  it('keeps the draft and the page usable when a rename fails', async () => {
+    mocked.setTitle.mockRejectedValue(new Error('rename refused'))
+    const { queryClient } = mount([project('6a16ddbf', 'Before'), project('other', 'Other paper')])
+    const loads = () => mocked.listProjects.mock.calls.length
+
+    const tr = await row('Before')
+    const field = await openRename('Before')
+    expect(within(tr).getByRole('button', { name: 'Delete 6a16ddbf' })).toBeDisabled()
+    // Another tab recreates the paper and the list refreshes while the field is open.
+    const replaced = { ...project('6a16ddbf', 'Before'), generation: 'gen-replaced' }
+    mocked.listProjects.mockResolvedValue({ projects: [replaced, project('other', 'Other paper')] })
+    await queryClient.invalidateQueries({ queryKey: PROJECTS_QUERY_KEY })
+    await waitFor(() => expect(mocked.listProjects).toHaveBeenCalledTimes(2))
+    await userEvent.clear(field)
+    const before = loads()
     await userEvent.type(field, 'Typed with care{Enter}')
-    expect(await screen.findByText('write refused')).toBeInTheDocument()
+    // The save names the paper the field was opened on, not the replacement.
+    expect(mocked.setTitle).toHaveBeenLastCalledWith('6a16ddbf', 'Typed with care', 'gen-6a16ddbf')
+    expect(await screen.findByText('rename refused')).toBeInTheDocument()
     expect(screen.getByLabelText('Paper name')).toHaveValue('Typed with care')
-  })
-
-  it('reloads the list when a rename is refused, so the next save uses fresh rows', async () => {
-    /** A paper replaced under the same name is refused; only a reloaded row carries its new generation. */
-    mocked.setTitle.mockRejectedValue(new Error('this paper changed since the list was loaded'))
-    mount([project('6a16ddbf', 'Before')])
-    const tr = await row('Before')
-    const loads = mocked.listProjects.mock.calls.length
-    await userEvent.click(renameButton(tr, 'Before'))
-    const field = screen.getByLabelText('Paper name')
-    await userEvent.clear(field)
-    await userEvent.type(field, 'Typed with care{Enter}')
-    await waitFor(() => expect(mocked.listProjects.mock.calls.length).toBeGreaterThan(loads))
-    expect(screen.getByLabelText('Paper name')).toHaveValue('Typed with care')
-  })
-
-  it('offers no hand-off to the agent while the failed rename is still open', async () => {
-    /** The hand-off leaves the page, which would throw away the draft just kept. */
-    mocked.setTitle.mockRejectedValue(new Error('write refused'))
-    mount([project('6a16ddbf', 'Before')])
-    const tr = await row('Before')
-    await userEvent.click(renameButton(tr, 'Before'))
-    const field = screen.getByLabelText('Paper name')
-    await userEvent.clear(field)
-    await userEvent.type(field, 'Typed with care{Enter}')
-    expect(await screen.findByText('write refused')).toBeInTheDocument()
+    // The agent hand-off would leave the page and lose the draft.
     expect(screen.queryByRole('button', { name: /agent/i })).toBeNull()
+    // The list reloads, and after that refusal the retry carries the fresh generation.
+    await waitFor(() => expect(loads()).toBeGreaterThan(before))
+    await userEvent.type(screen.getByLabelText('Paper name'), '{Enter}')
+    await waitFor(() => expect(mocked.setTitle).toHaveBeenLastCalledWith('6a16ddbf', 'Typed with care', 'gen-replaced'))
+
+    // Another row's pencil does not discard the draft.
+    await userEvent.click(within(await row('Other paper')).getByRole('button', { name: 'Rename Other paper' }))
+    expect(screen.getByLabelText('Paper name')).toHaveValue('Typed with care')
+
+    // The paper is deleted elsewhere: the field closes and the page is usable again.
+    mocked.listProjects.mockResolvedValue({ projects: [project('other', 'Other paper')] })
+    await userEvent.type(screen.getByLabelText('Paper name'), '{Enter}')
+    await closed()
+    expect(within(await row('Other paper')).getByRole('button', { name: 'Rename Other paper' })).toBeEnabled()
+
+    // A clone still running opens its paper when it ends, so no rename starts meanwhile.
+    mocked.cloneProject.mockReturnValue(new Promise(() => {}))
+    await userEvent.type(screen.getByLabelText('Repository URL'), 'https://example.com/r.git{Enter}')
+    await waitFor(() => expect(mocked.cloneProject).toHaveBeenCalled())
+    expect(within(await row('Other paper')).getByRole('button', { name: 'Rename Other paper' })).toBeDisabled()
   })
 
-  it('does not open another paper while a rename is still being saved', async () => {
-    /** Leaving would unmount the list, and a save that then failed would lose the draft. */
+  it('leaves nothing to navigate away while a rename is saving', async () => {
     mocked.setTitle.mockReturnValue(new Promise(() => {}))
     const onOpen = vi.fn()
     mount([project('6a16ddbf', 'Before'), project('other', 'Other paper')], onOpen)
-    const tr = await row('Before')
-    await userEvent.click(renameButton(tr, 'Before'))
-    const field = screen.getByLabelText('Paper name')
+
+    const field = await openRename('Before')
     await userEvent.clear(field)
     await userEvent.type(field, 'Typed with care')
+    // Clicking another paper blurs the field (which saves) but does not open it.
     await userEvent.click(screen.getByText('Other paper'))
     await waitFor(() => expect(mocked.setTitle).toHaveBeenCalledWith('6a16ddbf', 'Typed with care', 'gen-6a16ddbf'))
     expect(onOpen).not.toHaveBeenCalled()
-  })
+    expect(screen.getByLabelText('Paper name')).toBeDisabled()
 
-  it('does not create or clone a paper while a rename is still being saved', async () => {
-    /** Both open the new paper on success, which unmounts the list like a row click. */
-    mocked.setTitle.mockReturnValue(new Promise(() => {}))
-    mount([project('6a16ddbf', 'Before')])
-    const tr = await row('Before')
-    await userEvent.click(renameButton(tr, 'Before'))
-    const field = screen.getByLabelText('Paper name')
-    await userEvent.clear(field)
-    await userEvent.type(field, 'Typed with care')
+    // Create and Clone open the new paper too, so they wait as well.
     await userEvent.type(screen.getByLabelText('New paper name'), 'fresh{Enter}')
     await userEvent.click(screen.getByRole('button', { name: /Create/ }))
     await userEvent.type(screen.getByLabelText('Repository URL'), 'https://example.com/r.git{Enter}')
     await userEvent.click(screen.getByRole('button', { name: /Clone/ }))
-    await waitFor(() => expect(mocked.setTitle).toHaveBeenCalledWith('6a16ddbf', 'Typed with care', 'gen-6a16ddbf'))
     expect(mocked.createProject).not.toHaveBeenCalled()
     expect(mocked.cloneProject).not.toHaveBeenCalled()
   })
 
-  it('keeps a failed draft when another row\'s pencil is clicked', async () => {
-    mocked.setTitle.mockRejectedValue(new Error('rename refused'))
-    mount([project('6a16ddbf', 'Before'), project('other', 'Other paper')])
-    const tr = await row('Before')
-    await userEvent.click(renameButton(tr, 'Before'))
-    const field = screen.getByLabelText('Paper name')
-    await userEvent.clear(field)
-    await userEvent.type(field, 'Typed with care')
-    await userEvent.click(renameButton(await row('Other paper'), 'Other paper'))
-    expect(screen.getByLabelText('Paper name')).toHaveValue('Typed with care')
-  })
-
-  it('shows the saved name even when the list refetch fails', async () => {
+  it('shows a saved name even when the list reload fails, and the banner closes', async () => {
     mocked.setTitle.mockResolvedValue({ ok: true, title: 'Saved name' })
     mount([project('6a16ddbf', 'Before')])
-    const tr = await row('Before')
+    const field = await openRename('Before')
     mocked.listProjects.mockRejectedValue(new Error('list unavailable'))
-    await userEvent.click(renameButton(tr, 'Before'))
-    const field = screen.getByLabelText('Paper name')
     await userEvent.clear(field)
     await userEvent.type(field, 'Saved name{Enter}')
     expect(await screen.findByText('Saved name')).toBeInTheDocument()
-    expect(await screen.findByText('list unavailable')).toBeInTheDocument()
-  })
-
-  it('locks the field while the rename is being saved', async () => {
-    mocked.setTitle.mockReturnValue(new Promise(() => {}))
-    mount([project('6a16ddbf', 'Before')])
-    const tr = await row('Before')
-    await userEvent.click(renameButton(tr, 'Before'))
-    const field = screen.getByLabelText('Paper name')
-    await userEvent.clear(field)
-    await userEvent.type(field, 'Saving{Enter}')
-    await waitFor(() => expect(screen.getByLabelText('Paper name')).toBeDisabled())
-  })
-
-  it('closes the field when its paper leaves the list, so the page is usable again', async () => {
-    mocked.setTitle.mockRejectedValue(new Error('rename refused'))
-    mount([project('6a16ddbf', 'Before'), project('other', 'Other paper')])
-    const tr = await row('Before')
-    await userEvent.click(renameButton(tr, 'Before'))
-    // Deleting the row under an open field is not offered.
-    expect(within(tr).getByRole('button', { name: 'Delete 6a16ddbf' })).toBeDisabled()
-    // Deleted elsewhere: the reload after the refused save no longer has it.
-    mocked.listProjects.mockResolvedValue({ projects: [project('other', 'Other paper')] })
-    const field = screen.getByLabelText('Paper name')
-    await userEvent.clear(field)
-    await userEvent.type(field, 'Typed with care{Enter}')
-    await waitFor(() => expect(screen.queryByLabelText('Paper name')).toBeNull())
-    expect(renameButton(await row('Other paper'), 'Other paper')).toBeEnabled()
-  })
-})
-
-describe('the error banner', () => {
-  it('dismisses a list-load error', async () => {
-    mocked.listProjects.mockRejectedValue(new Error('list unavailable'))
-    renderWithProviders(<ProjectList onOpenProject={() => {}} />)
-    await screen.findByText('list unavailable', {}, { timeout: 5000 })
+    expect(await screen.findByText('list unavailable', {}, { timeout: 5000 })).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText('list unavailable')).toBeNull()
   })

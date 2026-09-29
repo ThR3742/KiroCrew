@@ -51,6 +51,16 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
   const [renameDraft, setRenameDraft] = useState('')
   // What the field opened with — a draft still equal to it is not an edit.
   const [renameSeed, setRenameSeed] = useState('')
+  // The generation of the paper the field was opened on, sent with the save.
+  // Read from the live list at save time instead, a refresh while the field is
+  // open (after another row's delete, say) would hand over the generation of a
+  // paper recreated under the same name, and the save would rename that paper.
+  const [renameGeneration, setRenameGeneration] = useState('')
+  // Set by a refused save. The refusal banner is the user's notice that the
+  // paper may have changed, so the next Enter takes the reloaded generation.
+  // A second replacement between that refusal and the retry is accepted: all
+  // it can overwrite is a display name, which another rename sets back.
+  const [renameRebind, setRenameRebind] = useState(false)
 
   const projectsQuery = useQuery({
     queryKey: PROJECTS_KEY,
@@ -149,6 +159,8 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
     mutationFn: ({ name, title, generation }: { name: string; title: string; generation: string }) =>
       papyrusApi.setTitle(name, title, generation),
     onSuccess: (result, { name }) => {
+      // A banner left by an earlier refused try would make this success read as a failure.
+      setError('')
       // Show the saved name NOW, from the answer, rather than only after the
       // list refetch below — which can fail, and would leave the old title on
       // screen with the field already closed.
@@ -165,6 +177,7 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
     },
     onError: (err: Error) => {
       setError(err.message)
+      setRenameRebind(true)
       // A refusal for a replaced paper is cured by fresh rows: reloading gives
       // this row the current generation, so the next Enter saves. The field keeps
       // the draft either way.
@@ -178,6 +191,8 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
     setRenaming(project.name)
     setRenameDraft(seed)
     setRenameSeed(seed)
+    setRenameGeneration(project.generation ?? '')
+    setRenameRebind(false)
   }
 
   /**
@@ -206,17 +221,26 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
     // Sent even when blank: an empty title CLEARS the override on the server, which
     // is how a paper goes back to the title its document declares. The field only
     // closes on success, so a failed request leaves the typed name in place.
-    const generation = projects.find(p => p.name === name)?.generation ?? ''
+    let generation = renameGeneration
+    if (renameRebind) {
+      generation = projects.find(p => p.name === name)?.generation ?? ''
+      setRenameGeneration(generation)
+      setRenameRebind(false)
+    }
     renameMutation.mutate({ name, title, generation }, { onSuccess: cancelRename })
   }
 
   /**
    * Open a paper, unless a rename is still open. Clicking another row blurs the
    * field, which starts the save — and leaving now would unmount this list, so
-   * a save that then failed would lose the draft it is meant to keep. The field
-   * closes on success, after which the click goes through.
+   * a save that then failed would lose the draft it is meant to keep. The click
+   * is discarded; once the field closes on success, the user clicks again.
    */
   const renameOpen = Boolean(renaming) || renameMutation.isPending
+  // The reverse wait: a Create or Clone still running will open its new paper
+  // when it finishes, unmounting this list, so a rename started meanwhile would
+  // lose its unsaved draft. The pencils stay disabled until it settles.
+  const leavingSoon = createMutation.isPending || cloneMutation.isPending
   // A row deleted while its field is open unmounts the field without a blur, so
   // nothing else would clear `renaming` — and every pencil, Create, Clone and
   // open would stay disabled until a page reload.
@@ -492,7 +516,7 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
                         onClick={() => startRename(project)}
                         // Another row's pencil would replace an open draft, which a
                         // failed save of that draft must keep.
-                        disabled={renameOpen}
+                        disabled={renameOpen || leavingSoon}
                         className="p-1 rounded text-muted hover:text-accent hover:bg-accent/10 cursor-pointer bg-transparent border-none transition-colors disabled:opacity-40"
                       >
                         <Pencil className="lucide-inline" />
