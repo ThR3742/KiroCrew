@@ -23,7 +23,7 @@ Routes (browser-facing, same-origin authed):
   POST   /api/apps/papyrus/file                      {"name","path","content"?}  (create)
   DELETE /api/apps/papyrus/file?name=<n>&path=<p>    -> {"ok": true}
   PUT    /api/apps/papyrus/main                      {"name","path"}
-  PUT    /api/apps/papyrus/title                     {"name","title"} -> {"ok","title"}
+  PUT    /api/apps/papyrus/title                     {"name","title","generation"} -> {"ok","title"}
   POST   /api/apps/papyrus/compile                   {"name"} -> CompileResult
   GET    /api/apps/papyrus/pdf?name=<n>              -> application/pdf
   GET    /api/apps/papyrus/git?name=<n>              -> GitStatus
@@ -400,9 +400,8 @@ async def _handle_provision_compiler(request: web.Request) -> web.StreamResponse
 def _display_title(title: str, name: str) -> str:
     """Redact a paper title bound for the list, falling back to the identifier.
 
-    A title is not authored by this app: it comes from the document's own
-    ``\\title{}`` or from ``.papyrus.json``, and BOTH arrive wholesale with
-    ``POST /projects/clone``. That makes it the same class of text as the compile
+    A title is not authored by this app alone: it is stored in ``.papyrus.json``,
+    which arrives wholesale with ``POST /projects/clone``. That makes it the same class of text as the compile
     log — untrusted content rendered in the dashboard — so it takes the same
     redaction pass, which is also what keeps a token pasted into a title out of
     the paper list.
@@ -422,13 +421,16 @@ def _display_title(title: str, name: str) -> str:
 
 
 async def _handle_list_projects(request: web.Request) -> web.StreamResponse:
-    projects = await asyncio.to_thread(store.list_projects)
-    rows = []
-    for project in projects:
-        row = project.to_dict()
-        row["title"] = _display_title(str(row["title"]), project.name)
-        rows.append(row)
-    return web.json_response({"projects": rows})
+    def _rows() -> list[dict[str, Any]]:
+        """BLOCKING — list and redact in one hop: redaction is CPU work per row."""
+        rows = []
+        for project in store.list_projects():
+            row = project.to_dict()
+            row["title"] = _display_title(str(row["title"]), project.name)
+            rows.append(row)
+        return rows
+
+    return web.json_response({"projects": await asyncio.to_thread(_rows)})
 
 
 async def _handle_create_project(request: web.Request) -> web.StreamResponse:
@@ -535,7 +537,8 @@ async def _handle_get_project(request: web.Request) -> web.StreamResponse:
             # row that opened it cannot disagree about what the paper is called.
             # Resolved here rather than derived on the client: the client holds
             # only `name`, and a paper opened by URL never went through the list.
-            store.project_title(project, main_file),
+            # Redacted in this hop, off the event loop, like the compile log.
+            _display_title(store.project_title(project), project.name),
             store.list_files(project),
             bool((pdf := store.pdf_path(project, main_file)) and pdf.is_file()),
         )
@@ -546,10 +549,10 @@ async def _handle_get_project(request: web.Request) -> web.StreamResponse:
     return web.json_response(
         {
             "name": project.name,
-            # Through the SAME redaction the list row takes: the title is untrusted
-            # (a cloned `.tex` or `.papyrus.json` supplies it) and it lands in the
-            # dashboard header.
-            "title": _display_title(title, project.name),
+            # Through the SAME redaction the list row takes (applied in `_read`):
+            # the title is untrusted (a cloned `.tex` or `.papyrus.json` supplies
+            # it) and it lands in the dashboard header.
+            "title": title,
             "main_file": main_file,
             "files": files,
             "has_pdf": has_pdf,
@@ -695,7 +698,8 @@ async def _handle_set_main(request: web.Request) -> web.StreamResponse:
         _safe_relative(project, relative)
         if not store.safe_child(project, relative).is_file():
             raise FileNotFoundError(relative)
-        store.set_main_file(project, relative)
+        if not store.set_main_file(project, relative):
+            raise store.ConfigWriteRefused(project.name)
 
     try:
         await asyncio.to_thread(_apply)
@@ -703,6 +707,15 @@ async def _handle_set_main(request: web.Request) -> web.StreamResponse:
         raise web.HTTPBadRequest(reason=str(exc)) from exc
     except FileNotFoundError as exc:
         raise web.HTTPNotFound(reason="file not found") from exc
+    except store.ConfigWriteRefused:
+        return web.json_response(
+            {
+                "error": "this paper's settings file cannot be written, so the main "
+                "document was not changed",
+                "code": "project_config_refused",
+            },
+            status=409,
+        )
     return web.json_response({"ok": True, "main_file": relative})
 
 
@@ -710,9 +723,8 @@ async def _handle_set_title(request: web.Request) -> web.StreamResponse:
     """Rename what the list DISPLAYS for a paper; the directory keeps its name.
 
     An empty ``title`` clears the override and the response carries whatever the
-    list will show next — the document's own ``\\title{}`` if it has one, else the
-    directory name — so the client renders the answer instead of guessing which
-    of the three sources won.
+    list will show next — the directory name — so the client renders the answer
+    instead of guessing.
     """
     body = await _json_body(request)
     name = _str_field(body, "name")
@@ -727,7 +739,7 @@ async def _handle_set_title(request: web.Request) -> web.StreamResponse:
     if not isinstance(generation, str) or not generation:
         raise web.HTTPBadRequest(reason="generation must be a non-empty string")
 
-    def _apply() -> tuple[str, str]:
+    def _apply() -> str:
         """BLOCKING — authorize the name, then write the config, in ONE hop.
 
         The config lock is taken BEFORE the existence check and held through the
@@ -745,12 +757,12 @@ async def _handle_set_title(request: web.Request) -> web.StreamResponse:
             if store.project_generation(project) != generation:
                 raise store.ProjectReplaced(project.name)
             store.set_project_title_locked(project, title)
-        # Resolved after the lock is released: resolving the main document can
-        # persist it, which takes the same lock.
-        return project.name, store.project_title(project, store.resolve_main_file(project))
+        # Redacted here, off the event loop.
+        resolved = store.project_title(project)
+        return _display_title(resolved, project.name)
 
     try:
-        project_name, resolved = await asyncio.to_thread(_apply)
+        resolved = await asyncio.to_thread(_apply)
     except store.TitleRejected:
         return web.json_response(
             {
@@ -776,7 +788,7 @@ async def _handle_set_title(request: web.Request) -> web.StreamResponse:
             },
             status=409,
         )
-    return web.json_response({"ok": True, "title": _display_title(resolved, project_name)})
+    return web.json_response({"ok": True, "title": resolved})
 
 
 # ── compile + pdf ───────────────────────────────────────────────────────────

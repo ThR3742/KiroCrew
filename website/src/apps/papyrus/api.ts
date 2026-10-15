@@ -24,8 +24,8 @@ export interface Project {
   modified: number
   has_pdf: boolean
   /**
-   * What to DISPLAY for this paper: the name the user set, else the document's
-   * own `\title{}`, else `name`. Never an identifier — `name` stays the key for
+   * What to DISPLAY for this paper: the name the user set, else `name`. Never an
+   * identifier — `name` stays the key for
    * every call below, for the PDF URL and for the paper's chat slot, so a
    * rename cannot break a link.
    *
@@ -250,8 +250,7 @@ export const papyrusApi = {
    * Rename what the list shows for a paper. `name` (the directory) is untouched.
    *
    * An empty `title` CLEARS the override, and the response carries whatever wins
-   * next — the document's own `\title{}` if it declares one, else `name` — so the
-   * caller renders the answer instead of re-deriving it.
+   * next — `name` — so the caller renders the answer instead of re-deriving it.
    */
   setTitle: (name: string, title: string, generation: string) =>
     send<{ ok: boolean; title: string }>('PUT', '/title', { name, title, generation }),

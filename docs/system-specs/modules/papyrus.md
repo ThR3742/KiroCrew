@@ -42,7 +42,7 @@ once at gateway startup and an unwrapped one would answer regardless of the opt-
 | POST | `/file` | Create a file, refusing to clobber |
 | DELETE | `/file` | Delete a file; the main document is refused |
 | PUT | `/main` | Choose which `.tex` is the main document |
-| PUT | `/title` | Set the paper's display name, or clear it with an empty value and fall back to the document's `\title{}` (see Naming a paper). **400** when `title` is missing or not a string — an explicit `""` is the clear, so an absent field must not be read as one. **409 `project_config_refused`** when `.papyrus.json` is a link or uncontained and cannot be written, rather than answering success over a rename that was not saved. **400** when `generation` is missing: it is the value the list row carried (`GET /projects` sends one per paper), and **409 `project_replaced`** answers a row loaded before its paper was deleted and recreated under the same name, so a stale list cannot rename the replacement |
+| PUT | `/title` | Set the paper's display name, or clear it with an empty value and fall back to the directory name (see Naming a paper). **400** when `title` is missing or not a string — an explicit `""` is the clear, so an absent field must not be read as one. **409 `project_config_refused`** when `.papyrus.json` is a link or uncontained and cannot be written, rather than answering success over a rename that was not saved. **400** when `generation` is missing: it is the value the list row carried (`GET /projects` sends one per paper), and **409 `project_replaced`** answers a row loaded before its paper was deleted and recreated under the same name, so a stale list cannot rename the replacement |
 | POST | `/compile` | Compile and return `{ok, log, errors[], duration_ms}`. **422 on a failed compile, and the log/diagnostics still ride the response** — that payload is exactly what the user needs to fix the document. **422 `compiler_sandbox_unavailable`** is the distinct case where this host could not build an OS-level sandbox, so the compiler never ran (see Platform) |
 | GET | `/pdf` | Serve the compiled PDF (see Security) |
 | GET | `/git` | Branch, dirtiness, ahead/behind, recent commits — or `{is_git: false}` |
@@ -99,27 +99,20 @@ That slug is the app's **identifier** — the `?name=` of every route, the PDF U
 the "last opened paper" pointer, the key of the paper's co-author session — and it
 is never renamed. For a cloned paper it is the last segment of the clone URL,
 which for an Overleaf remote is the project id, so on its own it shows the reader
-a string they never chose. A **display name** is therefore resolved beside it,
-from three sources in order:
+a string they never chose. A **display name** can therefore be set beside it: the
+name the user typed, held in `.papyrus.json`, else the directory name.
+`PUT /title` sets it and an empty value clears it.
 
-1. the name the user set, held in `.papyrus.json`;
-2. the document's own `\title{}` — a beamer short title (`\title[…]{…}`) wins over
-   the long form, being the form a table cell asks for;
-3. the directory name.
-
-The user's choice outranks the document because it is the only one of the three
-they can act on: a `\title{}` that outranked it would make renaming a paper that
-declares one do nothing. `PUT /title` writes source 1 and an empty value clears
-it, which is the only way back to sources 2 and 3.
-
-Both title sources are **untrusted** — a `.tex` is authored outside this app and
-`.papyrus.json` can be shipped inside a cloned repository — so a resolved title
-is flattened out of LaTeX markup, stripped of control **and format** characters (a
-bidi override in a name reorders the whole row), passed through the same redaction
-the compile log takes, and only then length-capped — cutting first could split a
-credential into a fragment the redactor no longer recognizes. For the same reason a raw title
-longer than the sanitizer's work bound is no title at all rather than a cut prefix. Extraction reads a bounded prefix of the
-preamble, so listing N papers does not read N whole documents.
+The name is **untrusted** — `.papyrus.json` can be shipped inside a cloned
+repository — so it is kept as plain text: `%` and a backslash are ordinary
+characters, while control **and format** characters (a bidi override in a name
+reorders the whole row) are removed, a line break or tab becoming a space. A name
+with nothing left is refused, and a refused stored name falls back to the
+directory name. It then
+takes the same redaction the compile log takes, and only then is length-capped —
+cutting first could split a credential into a fragment the redactor no longer
+recognizes. For the same reason a raw name longer than the sanitizer's work
+bound is no name at all rather than a cut prefix.
 
 ## Security model
 
@@ -222,7 +215,7 @@ input. `get_main_file` re-validates the configured value through `safe_child` on
 
 Its `title` key is untrusted for a second reason: it is **display text**, so a
 cloned repo can ship a name that lands in a dashboard table cell. It takes the
-same treatment as a title read out of a `.tex` — see Naming a paper.
+treatment described in Naming a paper.
 
 ### The compiler is never given shell escape
 
